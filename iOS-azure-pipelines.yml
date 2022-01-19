@@ -1,20 +1,330 @@
-# Xcode
-# Build, test, and archive an Xcode workspace on macOS.
-# Add steps that install certificates, test, sign, and distribute an app, save build artifacts, and more:
-# https://docs.microsoft.com/azure/devops/pipelines/languages/xcode
-
 trigger:
-- master
+   batch: true
+   branches:
+    include:
+      - develop
+      - feature/*
+      - fix/*
+      - refactor/*
 
 pool:
-  vmImage: 'macos-latest'
+  vmImage: 'macOS-latest'
 
-steps:
-- task: Xcode@5
-  inputs:
-    actions: 'build'
-    scheme: ''
-    sdk: 'iphoneos'
-    configuration: 'Release'
-    xcWorkspacePath: '**/*.xcodeproj/project.xcworkspace'
-    xcodeVersion: 'default' # Options: 8, 9, 10, 11, 12, default, specifyPath
+name: $(SourceBranchName)_$(Date:yyyyMMdd)_$(Hours)_$(Minutes)_$(Rev:r)
+
+variables:
+  isRelease: $[in(True, eq(variables['Build.SourceBranchName'], 'develop'), contains(variables['Build.SourceBranch'], 'release/'), eq(variables['releaseType'], 'Prod'))]
+  isQA: $[in(True, contains(variables['Build.SourceBranch'], 'feature/'), contains(variables['Build.SourceBranch'], 'fix/'), contains(variables['Build.SourceBranch'], 'refactor/'), eq(variables['isRelease'], true))]
+  XCODE_VERSION: '/Applications/Xcode_12.4.app'
+  COCOAPOD_CACHE_FOLDER: $(Build.SourcesDirectory)/Pods
+
+stages:
+- stage: Prepare_for_build
+  jobs:
+  - job: Prepare_for_build
+    steps:
+      - bash: |
+          sudo xcode-select --switch $(XCODE_VERSION)
+          swift -version
+        displayName: Select Xcode version
+
+      - task: Cache@2
+        inputs:
+          key: cocoapods | "$(XCODE_VERSION)" | Podfile.lock
+          path: $(COCOAPOD_CACHE_FOLDER)
+          cacheHitVar: CACHE_RESTORED
+        displayName: Cache cocoapods
+
+      - task: CocoaPods@0
+        displayName: 'Cocoapod installation'
+        condition: ne(variables.CACHE_RESTORED, 'true')
+
+- stage: Unit_Tests
+  dependsOn: Prepare_for_build
+  jobs:
+  - job: Run_Unit_Tests
+    steps:
+      - task: Cache@2
+        inputs:
+          key: cocoapods | "$(XCODE_VERSION)" | Podfile.lock
+          path: $(COCOAPOD_CACHE_FOLDER)
+          cacheHitVar: CACHE_RESTORED
+        displayName: Cache cocoapods
+
+      - task: Xcode@5
+        displayName: Run unit tests
+        inputs:
+          actions: 'test'
+          scheme: 'iosApp-Dev'
+          sdk: 'iphonesimulator'
+          configuration: 'Dev'
+          xcWorkspacePath: 'iosApp.xcworkspace'
+          xcodeVersion: 'specifyPath'
+          xcodeDeveloperDir: '$(XCODE_VERSION)/Contents/Developer'
+          destinationSimulators: 'iPhone 11'
+          destinationTypeOption: 'simulators'
+          destinationPlatformOption: 'iOS'
+          useXcpretty: true
+          publishJUnitResults: true
+        condition: succeeded()
+
+- stage: QA_Build
+  condition: and(succeeded(), or(eq(variables['isQA'], true), eq(variables['releaseType'], 'QA')))
+  dependsOn: Prepare_for_build
+  jobs:
+  - job: Build_For_QA
+    steps:
+      - task: InstallAppleCertificate@2
+        displayName: Install distribution certificat
+        inputs:
+          certSecureFile: 'distribution_cert.p12'
+          certPwd: $(P12Password)
+
+      - task: InstallAppleProvisioningProfile@1
+        displayName: Install QA/UAT provisioning profile
+        inputs:
+          provProfileSecureFile: Countdown_Pickup_QA_Adhoc.mobileprovision
+
+      - task: Cache@2
+        inputs:
+          key: cocoapods | "$(XCODE_VERSION)" | Podfile.lock
+          path: $(COCOAPOD_CACHE_FOLDER)
+          cacheHitVar: CACHE_RESTORED
+        displayName: Cache cocoapods
+
+      - task: Xcode@5
+        displayName: Build QA
+        inputs:
+          actions: 'clean build'
+          scheme: 'iosApp-QA'
+          configuration: 'QA'
+          sdk: 'iphoneos'
+          xcWorkspacePath: 'iosApp.xcworkspace'
+          xcodeVersion: 'specifyPath'
+          xcodeDeveloperDir: '$(XCODE_VERSION)/Contents/Developer'
+          archivePath: $(Build.SourcesDirectory)/Azure/QA/
+          signingOption: 'default'
+          exportOptions: 'plist'
+          exportOptionsPlist: $(Build.SourcesDirectory)/Azure/export_options_qa.plist
+          exportPath: $(Build.SourcesDirectory)/Azure/QA/
+          packageApp: true
+        condition: succeeded()
+
+      - task: CmdLine@2
+        displayName: Create QA release note
+        inputs:
+          script: |
+            lines=`grep -n -o -m 2 -e '###' $(Build.SourcesDirectory)/release_notes.md | cut -f1 -d:`
+            line1=`echo $lines | cut -f1 -d' '`
+            line2=`echo $lines | cut -f2 -d' '`
+            line2=`expr $line2 - 1`
+            echo "## iosApp QA Release Notes" >  $(Build.SourcesDirectory)/release_notes_qa.md
+            echo "" >>  $(Build.SourcesDirectory)/release_notes_qa.md
+            echo "`sed -n "$line1,$line2 p" $(Build.SourcesDirectory)/release_notes.md`" >> $(Build.SourcesDirectory)/release_notes_qa.md
+        condition: succeeded()
+
+      - bash: |
+          cp $(Build.SourcesDirectory)/*.md $(build.artifactStagingDirectory)
+        displayName: Copy the release notes
+        condition: succeeded()
+
+      - bash: |
+          cp $(Build.SourcesDirectory)/Azure/**/*.ipa $(build.artifactStagingDirectory)
+        displayName: Copy ipa files
+        condition: succeeded()
+
+      - task: PublishBuildArtifacts@1
+        displayName: Archive
+        condition: succeeded()
+        
+- stage: UAT_Build
+  condition: and(succeeded(), or(eq(variables['isQA'], true), eq(variables['releaseType'], 'UAT')))
+  dependsOn: Prepare_for_build
+  jobs:
+  - job: Build_For_UAT
+    steps:
+      - task: InstallAppleCertificate@2
+        displayName: Install distribution certificat
+        inputs:
+          certSecureFile: 'distribution_cert.p12'
+          certPwd: $(P12Password)
+
+      - task: InstallAppleProvisioningProfile@1
+        displayName: Install QA/UAT provisioning profile
+        inputs:
+          provProfileSecureFile: Countdown_Pickup_UAT_Adhoc.mobileprovision
+
+      - task: Cache@2
+        inputs:
+          key: cocoapods | "$(XCODE_VERSION)" | Podfile.lock
+          path: $(COCOAPOD_CACHE_FOLDER)
+          cacheHitVar: CACHE_RESTORED
+        displayName: Cache cocoapods
+
+      - task: Xcode@5
+        displayName: Build UAT
+        inputs:
+          actions: 'clean build'
+          scheme: 'iosApp-UAT'
+          configuration: 'UAT'
+          sdk: 'iphoneos'
+          xcWorkspacePath: 'iosApp.xcworkspace'
+          xcodeVersion: 'specifyPath'
+          xcodeDeveloperDir: '$(XCODE_VERSION)/Contents/Developer'
+          archivePath: $(Build.SourcesDirectory)/Azure/UAT/
+          signingOption: 'default'
+          exportOptions: 'plist'
+          exportOptionsPlist: $(Build.SourcesDirectory)/Azure/export_options_uat.plist
+          exportPath: $(Build.SourcesDirectory)/Azure/UAT/
+          packageApp: true
+        condition: succeeded()
+
+      - task: CmdLine@2
+        displayName: Create UAT release note
+        inputs:
+          script: |
+            lines=`grep -n -o -m 2 -e '###' $(Build.SourcesDirectory)/release_notes.md | cut -f1 -d:`
+            line1=`echo $lines | cut -f1 -d' '`
+            line2=`echo $lines | cut -f2 -d' '`
+            line2=`expr $line2 - 1`
+            echo "## iosApp UAT Release Notes" >  $(Build.SourcesDirectory)/release_notes_uat.md
+            echo "" >>  $(Build.SourcesDirectory)/release_notes_uat.md
+            echo "`sed -n "$line1,$line2 p" $(Build.SourcesDirectory)/release_notes.md`" >> $(Build.SourcesDirectory)/release_notes_uat.md
+        condition: succeeded()
+
+      - bash: |
+          cp $(Build.SourcesDirectory)/*.md $(build.artifactStagingDirectory)
+        displayName: Copy the release notes
+        condition: succeeded()
+
+      - bash: |
+          cp $(Build.SourcesDirectory)/Azure/**/*.ipa $(build.artifactStagingDirectory)
+        displayName: Copy ipa files
+        condition: succeeded()
+
+      - task: PublishBuildArtifacts@1
+        displayName: Archive
+        condition: succeeded()
+
+- stage: POC_Build
+  condition: and(succeeded(), eq(variables['releaseType'], 'POC'))
+  dependsOn: Prepare_for_build
+  jobs:
+  - job: Build_For_POC
+    steps:
+      - task: InstallAppleCertificate@2
+        displayName: Install distribution certificat
+        inputs:
+          certSecureFile: 'distribution_cert.p12'
+          certPwd: $(P12Password)
+
+      - task: InstallAppleProvisioningProfile@1
+        displayName: Install POC provisioning profile
+        inputs:
+          provProfileSecureFile: Countdown_Pickup_POC_Adhoc.mobileprovision
+
+      - task: Cache@2
+        inputs:
+          key: cocoapods | "$(XCODE_VERSION)" | Podfile.lock
+          path: $(COCOAPOD_CACHE_FOLDER)
+          cacheHitVar: CACHE_RESTORED
+        displayName: Cache cocoapods
+
+      - task: Xcode@5
+        displayName: Build POC
+        inputs:
+          actions: 'clean build'
+          scheme: 'iosApp-POC'
+          configuration: 'POC'
+          sdk: 'iphoneos'
+          xcWorkspacePath: 'iosApp.xcworkspace'
+          xcodeVersion: 'specifyPath'
+          xcodeDeveloperDir: '$(XCODE_VERSION)/Contents/Developer'
+          archivePath: $(Build.SourcesDirectory)/Azure/POC/
+          signingOption: 'default'
+          exportOptions: 'plist'
+          exportOptionsPlist: $(Build.SourcesDirectory)/Azure/export_options_poc.plist
+          exportPath: $(Build.SourcesDirectory)/Azure/POC/
+          packageApp: true
+        condition: succeeded()
+        
+      - task: CmdLine@2
+        displayName: Create POC release note
+        inputs:
+          script: |
+            buildNumber=`/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" $(Build.SourcesDirectory)/iosApp/App/Info.plist`
+            lineCountToGrep=`grep -n -o -e "### $buildNumber" $(Build.SourcesDirectory)/release_notes.md | wc -l`
+            lineCountToGrep=`expr $lineCountToGrep + 1`
+            lines=`grep -n -o -m $lineCountToGrep -e "### $buildNumber" $(Build.SourcesDirectory)/release_notes.md | cut -f1 -d:`
+            line1=`echo $lines | cut -f1 -d' '`
+            line2=`echo $lines | cut -f$lineCountToGrep -d' '`
+            line2=`expr $line2 - 1`
+            echo "## iosApp POC Release Notes" >  $(Build.SourcesDirectory)/release_notes_poc.md
+            echo "" >>  $(Build.SourcesDirectory)/release_notes_poc.md
+            echo "`sed -n "$line1,$line2 p" $(Build.SourcesDirectory)/release_notes.md`" >> $(Build.SourcesDirectory)/release_notes_poc.md
+        condition: succeeded()
+
+      - bash: |
+          cp $(Build.SourcesDirectory)/*.md $(build.artifactStagingDirectory)
+        displayName: Copy the release notes
+        condition: succeeded()
+
+      - bash: |
+          cp $(Build.SourcesDirectory)/Azure/**/*.ipa $(build.artifactStagingDirectory)
+        displayName: Copy ipa files
+        condition: succeeded()
+
+      - task: PublishBuildArtifacts@1
+        displayName: Archive
+        condition: succeeded()
+
+- stage: Prod_Build
+  condition: and(succeeded(), or(eq(variables['isRelease'], true), eq(variables['releaseType'], 'Prod')))
+  dependsOn: Prepare_for_build
+  jobs:
+  - job: Build_For_Prod
+    steps:
+      - task: InstallAppleCertificate@2
+        displayName: Install distribution certificat
+        inputs:
+          certSecureFile: 'distribution_cert.p12'
+          certPwd: $(P12Password)
+
+      - task: InstallAppleProvisioningProfile@1
+        displayName: Install Prod provisioning profile
+        inputs:
+          provProfileSecureFile: Countdown_Pickup_Prod.mobileprovision
+        condition: and(succeeded(), eq(variables['isRelease'], true))
+
+      - task: Cache@2
+        inputs:
+          key: cocoapods | "$(XCODE_VERSION)" | Podfile.lock
+          path: $(COCOAPOD_CACHE_FOLDER)
+          cacheHitVar: CACHE_RESTORED
+        displayName: Cache cocoapods
+
+      - task: Xcode@5
+        displayName: Build Prod
+        inputs:
+          actions: 'clean build'
+          scheme: 'iosApp-Prod'
+          configuration: 'Prod'
+          sdk: 'iphoneos'
+          xcWorkspacePath: 'iosApp.xcworkspace'
+          xcodeVersion: 'specifyPath'
+          xcodeDeveloperDir: '$(XCODE_VERSION)/Contents/Developer'
+          archivePath: $(Build.SourcesDirectory)/Azure/Prod/
+          signingOption: 'default'
+          exportOptions: 'plist'
+          exportOptionsPlist: $(Build.SourcesDirectory)/Azure/export_options_prod.plist
+          exportPath: $(Build.SourcesDirectory)/Azure/Prod/
+          packageApp: true
+
+      - bash: |
+          cp $(Build.SourcesDirectory)/Azure/**/*.ipa $(build.artifactStagingDirectory)
+        displayName: Copy ipa files
+        condition: succeeded()
+
+      - task: PublishBuildArtifacts@1
+        displayName: Archive
+        condition: succeeded()
